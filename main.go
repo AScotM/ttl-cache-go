@@ -49,6 +49,7 @@ type OptimizedTTLCache struct {
 	stats       CacheStats
 	stopChan    chan struct{}
 	stopped     bool
+	stoppedMu   sync.Mutex
 }
 
 type cacheItem struct {
@@ -172,9 +173,9 @@ func (c *OptimizedTTLCache) cleanupWorker() {
 		case <-ticker.C:
 			c.CleanupExpired()
 		case <-c.stopChan:
-			c.mu.Lock()
+			c.stoppedMu.Lock()
 			c.stopped = true
-			c.mu.Unlock()
+			c.stoppedMu.Unlock()
 			return
 		}
 	}
@@ -209,12 +210,13 @@ func (c *OptimizedTTLCache) Size() int {
 }
 
 func (c *OptimizedTTLCache) Stop() {
-	c.mu.Lock()
+	c.stoppedMu.Lock()
+	defer c.stoppedMu.Unlock()
+	
 	if !c.stopped {
 		close(c.stopChan)
 		c.stopped = true
 	}
-	c.mu.Unlock()
 }
 
 func (c *OptimizedTTLCache) Delete(key string) bool {
@@ -294,6 +296,23 @@ func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, b
 
 	c.stats.Hits++
 	return item.value, item.heapItem.expiration, true
+}
+
+func (c *OptimizedTTLCache) Peek(key string) (interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, exists := c.items[key]
+	if !exists {
+		return nil, false
+	}
+
+	now := time.Now()
+	if now.After(item.heapItem.expiration) {
+		return nil, false
+	}
+
+	return item.value, true
 }
 
 func main() {
