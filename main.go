@@ -15,8 +15,12 @@ type HeapItem struct {
 
 type MinHeap []*HeapItem
 
-func (h MinHeap) Len() int           { return len(h) }
-func (h MinHeap) Less(i, j int) bool { return h[i].expiration.Before(h[j].expiration) }
+func (h MinHeap) Len() int { return len(h) }
+
+func (h MinHeap) Less(i, j int) bool {
+	return h[i].expiration.Before(h[j].expiration)
+}
+
 func (h MinHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].index = i
@@ -50,6 +54,7 @@ type OptimizedTTLCache struct {
 	stopChan    chan struct{}
 	stopped     bool
 	stoppedMu   sync.Mutex
+	cleanupDone chan struct{}
 }
 
 type cacheItem struct {
@@ -75,11 +80,12 @@ func NewOptimizedTTLCache(capacity int, ttl time.Duration) *OptimizedTTLCache {
 	}
 
 	cache := &OptimizedTTLCache{
-		capacity:   capacity,
-		defaultTTL: ttl,
-		items:      make(map[string]*cacheItem),
-		expiryHeap: MinHeap{},
-		stopChan:   make(chan struct{}),
+		capacity:    capacity,
+		defaultTTL:  ttl,
+		items:       make(map[string]*cacheItem),
+		expiryHeap:  MinHeap{},
+		stopChan:    make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
 
 	heap.Init(&cache.expiryHeap)
@@ -136,6 +142,9 @@ func (c *OptimizedTTLCache) evictOne() {
 	}
 
 	heapItem := heap.Pop(&c.expiryHeap).(*HeapItem)
+	if heapItem.index != -1 {
+		return
+	}
 	delete(c.items, heapItem.key)
 	c.stats.Evictions++
 }
@@ -167,6 +176,7 @@ func (c *OptimizedTTLCache) Get(key string) (interface{}, bool) {
 func (c *OptimizedTTLCache) cleanupWorker() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	defer close(c.cleanupDone)
 
 	for {
 		select {
@@ -188,18 +198,22 @@ func (c *OptimizedTTLCache) CleanupExpired() int {
 	count := 0
 	now := time.Now()
 
+	toRemove := []*HeapItem{}
 	for c.expiryHeap.Len() > 0 {
 		heapItem := c.expiryHeap[0]
 		if now.Before(heapItem.expiration) {
 			break
 		}
-
+		toRemove = append(toRemove, heapItem)
 		heap.Pop(&c.expiryHeap)
-		delete(c.items, heapItem.key)
-		count++
-		c.stats.Expirations++
 	}
 
+	for _, heapItem := range toRemove {
+		delete(c.items, heapItem.key)
+		count++
+	}
+
+	c.stats.Expirations += int64(count)
 	return count
 }
 
@@ -211,11 +225,15 @@ func (c *OptimizedTTLCache) Size() int {
 
 func (c *OptimizedTTLCache) Stop() {
 	c.stoppedMu.Lock()
-	defer c.stoppedMu.Unlock()
-	
 	if !c.stopped {
 		close(c.stopChan)
 		c.stopped = true
+	}
+	c.stoppedMu.Unlock()
+
+	select {
+	case <-c.cleanupDone:
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -259,6 +277,8 @@ func (c *OptimizedTTLCache) Keys() []string {
 	for key, item := range c.items {
 		if now.Before(item.heapItem.expiration) {
 			keys = append(keys, key)
+		} else {
+			go c.Delete(key)
 		}
 	}
 
@@ -274,7 +294,11 @@ func (c *OptimizedTTLCache) Contains(key string) bool {
 		return false
 	}
 
-	return time.Now().Before(item.heapItem.expiration)
+	valid := time.Now().Before(item.heapItem.expiration)
+	if !valid {
+		go c.Delete(key)
+	}
+	return valid
 }
 
 func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, bool) {
@@ -315,12 +339,52 @@ func (c *OptimizedTTLCache) Peek(key string) (interface{}, bool) {
 	return item.value, true
 }
 
+func (c *OptimizedTTLCache) Resize(newCapacity int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if newCapacity <= 0 {
+		newCapacity = 1000
+	}
+
+	if newCapacity < c.capacity {
+		for len(c.items) > newCapacity {
+			c.evictOne()
+		}
+	}
+
+	c.capacity = newCapacity
+}
+
+func (c *OptimizedTTLCache) verifyHeap() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for i, item := range c.expiryHeap {
+		if item.index != i {
+			return false
+		}
+		if _, exists := c.items[item.key]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *OptimizedTTLCache) Capacity() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.capacity
+}
+
 func main() {
 	fmt.Println("=== Optimized TTL Cache with Heap ===")
 	fmt.Println()
 
 	cache := NewOptimizedTTLCache(5, 2*time.Second)
 	defer cache.Stop()
+
+	fmt.Printf("Initial capacity: %d\n", cache.Capacity())
 
 	cache.SetWithTTL("fast", "expires in 1s", 1*time.Second)
 	cache.SetWithTTL("medium", "expires in 3s", 3*time.Second)
@@ -339,12 +403,19 @@ func main() {
 		}
 	}
 
+	fmt.Println("\nAdding 10 items (capacity is 5)...")
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("item%d", i)
 		cache.SetWithTTL(key, i, time.Duration(i+1)*time.Second)
 	}
 
 	fmt.Printf("Size after adding: %d\n", cache.Size())
+
+	cache.Resize(8)
+	fmt.Printf("Capacity after resize: %d\n", cache.Capacity())
+
+	heapValid := cache.verifyHeap()
+	fmt.Printf("Heap integrity check: %v\n", heapValid)
 
 	time.Sleep(6 * time.Second)
 
