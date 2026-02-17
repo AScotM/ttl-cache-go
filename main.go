@@ -142,9 +142,6 @@ func (c *OptimizedTTLCache) evictOne() {
 	}
 
 	heapItem := heap.Pop(&c.expiryHeap).(*HeapItem)
-	if heapItem.index != -1 {
-		return
-	}
 	delete(c.items, heapItem.key)
 	c.stats.Evictions++
 }
@@ -269,17 +266,29 @@ func (c *OptimizedTTLCache) GetStats() CacheStats {
 
 func (c *OptimizedTTLCache) Keys() []string {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	keys := make([]string, 0, len(c.items))
 	now := time.Now()
+	expired := []string{}
+	keys := make([]string, 0, len(c.items))
 
 	for key, item := range c.items {
 		if now.Before(item.heapItem.expiration) {
 			keys = append(keys, key)
 		} else {
-			go c.Delete(key)
+			expired = append(expired, key)
 		}
+	}
+	c.mu.RUnlock()
+
+	if len(expired) > 0 {
+		c.mu.Lock()
+		for _, key := range expired {
+			if item, exists := c.items[key]; exists {
+				heap.Remove(&c.expiryHeap, item.heapItem.index)
+				delete(c.items, key)
+				c.stats.Expirations++
+			}
+		}
+		c.mu.Unlock()
 	}
 
 	return keys
@@ -287,16 +296,17 @@ func (c *OptimizedTTLCache) Keys() []string {
 
 func (c *OptimizedTTLCache) Contains(key string) bool {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	item, exists := c.items[key]
 	if !exists {
+		c.mu.RUnlock()
 		return false
 	}
 
 	valid := time.Now().Before(item.heapItem.expiration)
+	c.mu.RUnlock()
+
 	if !valid {
-		go c.Delete(key)
+		c.Delete(key)
 	}
 	return valid
 }
