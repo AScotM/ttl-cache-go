@@ -69,6 +69,7 @@ type CacheStats struct {
 	Misses      int64
 	Evictions   int64
 	Expirations int64
+	HitRate     float64
 }
 
 func NewOptimizedTTLCache(capacity int, ttl time.Duration) *OptimizedTTLCache {
@@ -94,10 +95,16 @@ func NewOptimizedTTLCache(capacity int, ttl time.Duration) *OptimizedTTLCache {
 }
 
 func (c *OptimizedTTLCache) Set(key string, value interface{}) {
+	if key == "" {
+		return
+	}
 	c.SetWithTTL(key, value, c.defaultTTL)
 }
 
 func (c *OptimizedTTLCache) SetWithTTL(key string, value interface{}, ttl time.Duration) {
+	if key == "" {
+		return
+	}
 	if ttl <= 0 {
 		ttl = c.defaultTTL
 	}
@@ -141,9 +148,29 @@ func (c *OptimizedTTLCache) evictOne() {
 		return
 	}
 
-	heapItem := heap.Pop(&c.expiryHeap).(*HeapItem)
-	delete(c.items, heapItem.key)
-	c.stats.Evictions++
+	now := time.Now()
+	if c.expiryHeap[0].expiration.Before(now) {
+		heapItem := heap.Pop(&c.expiryHeap).(*HeapItem)
+		delete(c.items, heapItem.key)
+		c.stats.Evictions++
+		return
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+	for key, item := range c.items {
+		if oldestKey == "" || item.accessTime.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = item.accessTime
+		}
+	}
+	
+	if oldestKey != "" {
+		item := c.items[oldestKey]
+		heap.Remove(&c.expiryHeap, item.heapItem.index)
+		delete(c.items, oldestKey)
+		c.stats.Evictions++
+	}
 }
 
 func (c *OptimizedTTLCache) Get(key string) (interface{}, bool) {
@@ -261,14 +288,22 @@ func (c *OptimizedTTLCache) Clear() {
 func (c *OptimizedTTLCache) GetStats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.stats
+	
+	stats := c.stats
+	total := stats.Hits + stats.Misses
+	if total > 0 {
+		stats.HitRate = float64(stats.Hits) / float64(total)
+	}
+	return stats
 }
 
 func (c *OptimizedTTLCache) Keys() []string {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
 	now := time.Now()
-	expired := []string{}
 	keys := make([]string, 0, len(c.items))
+	expired := []string{}
 
 	for key, item := range c.items {
 		if now.Before(item.heapItem.expiration) {
@@ -277,43 +312,40 @@ func (c *OptimizedTTLCache) Keys() []string {
 			expired = append(expired, key)
 		}
 	}
-	c.mu.RUnlock()
 
-	if len(expired) > 0 {
-		c.mu.Lock()
-		for _, key := range expired {
-			if item, exists := c.items[key]; exists {
-				heap.Remove(&c.expiryHeap, item.heapItem.index)
-				delete(c.items, key)
-				c.stats.Expirations++
-			}
+	for _, key := range expired {
+		if item, exists := c.items[key]; exists {
+			heap.Remove(&c.expiryHeap, item.heapItem.index)
+			delete(c.items, key)
+			c.stats.Expirations++
 		}
-		c.mu.Unlock()
 	}
 
 	return keys
 }
 
 func (c *OptimizedTTLCache) Contains(key string) bool {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
 	item, exists := c.items[key]
 	if !exists {
-		c.mu.RUnlock()
 		return false
 	}
 
-	valid := time.Now().Before(item.heapItem.expiration)
-	c.mu.RUnlock()
-
-	if !valid {
-		c.Delete(key)
+	if time.Now().After(item.heapItem.expiration) {
+		heap.Remove(&c.expiryHeap, item.heapItem.index)
+		delete(c.items, key)
+		c.stats.Expirations++
+		return false
 	}
-	return valid
+	
+	return true
 }
 
 func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	item, exists := c.items[key]
 	if !exists {
@@ -323,6 +355,8 @@ func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, b
 
 	now := time.Now()
 	if now.After(item.heapItem.expiration) {
+		heap.Remove(&c.expiryHeap, item.heapItem.index)
+		delete(c.items, key)
 		c.stats.Misses++
 		c.stats.Expirations++
 		return nil, time.Time{}, false
@@ -366,25 +400,47 @@ func (c *OptimizedTTLCache) Resize(newCapacity int) {
 	c.capacity = newCapacity
 }
 
-func (c *OptimizedTTLCache) verifyHeap() bool {
+func (c *OptimizedTTLCache) VerifyHeap() (bool, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	for i, item := range c.expiryHeap {
 		if item.index != i {
-			return false
+			return false, fmt.Sprintf("index mismatch at %d: expected %d, got %d", i, i, item.index)
 		}
 		if _, exists := c.items[item.key]; !exists {
-			return false
+			return false, fmt.Sprintf("heap item %s not found in items map", item.key)
 		}
 	}
-	return true
+	return true, "heap is valid"
 }
 
 func (c *OptimizedTTLCache) Capacity() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.capacity
+}
+
+func (c *OptimizedTTLCache) GetMultiple(keys []string) map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	result := make(map[string]interface{})
+	now := time.Now()
+	
+	for _, key := range keys {
+		if item, exists := c.items[key]; exists {
+			if !now.After(item.heapItem.expiration) {
+				result[key] = item.value
+				c.stats.Hits++
+			} else {
+				c.stats.Misses++
+			}
+		} else {
+			c.stats.Misses++
+		}
+	}
+	return result
 }
 
 func main() {
@@ -424,19 +480,23 @@ func main() {
 	cache.Resize(8)
 	fmt.Printf("Capacity after resize: %d\n", cache.Capacity())
 
-	heapValid := cache.verifyHeap()
-	fmt.Printf("Heap integrity check: %v\n", heapValid)
+	heapValid, message := cache.VerifyHeap()
+	fmt.Printf("Heap integrity check: %v - %s\n", heapValid, message)
 
 	time.Sleep(6 * time.Second)
 
 	fmt.Printf("Size after cleanup: %d\n", cache.Size())
 
 	stats := cache.GetStats()
-	fmt.Printf("Stats - Hits: %d, Misses: %d, Evictions: %d, Expirations: %d\n",
-		stats.Hits, stats.Misses, stats.Evictions, stats.Expirations)
+	fmt.Printf("Stats - Hits: %d, Misses: %d, Evictions: %d, Expirations: %d, HitRate: %.2f\n",
+		stats.Hits, stats.Misses, stats.Evictions, stats.Expirations, stats.HitRate)
 
 	keys := cache.Keys()
 	fmt.Printf("Active keys: %v\n", keys)
+
+	multipleKeys := []string{"item5", "item6", "item7", "nonexistent"}
+	multipleResults := cache.GetMultiple(multipleKeys)
+	fmt.Printf("Multiple get results: %v\n", multipleResults)
 
 	fmt.Println("\n=== Demo Complete ===")
 }
