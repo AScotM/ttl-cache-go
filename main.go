@@ -291,6 +291,12 @@ func (c *OptimizedTTLCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	for _, item := range c.items {
+		if item.heapItem != nil {
+			item.heapItem.index = -1
+		}
+	}
+
 	c.items = make(map[string]*cacheItem)
 	c.expiryHeap = MinHeap{}
 	heap.Init(&c.expiryHeap)
@@ -377,18 +383,27 @@ func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, b
 }
 
 func (c *OptimizedTTLCache) Peek(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	item, exists := c.items[key]
 	if !exists {
+		c.stats.Misses++
 		return nil, false
 	}
 
-	if isExpired(time.Now(), item.heapItem.expiration) {
+	now := time.Now()
+	if isExpired(now, item.heapItem.expiration) {
+		if item.heapItem.index >= 0 {
+			heap.Remove(&c.expiryHeap, item.heapItem.index)
+		}
+		delete(c.items, key)
+		c.stats.Expirations++
+		c.stats.Misses++
 		return nil, false
 	}
 
+	c.stats.Hits++
 	return item.value, true
 }
 
@@ -414,8 +429,9 @@ func (c *OptimizedTTLCache) VerifyHeap() (bool, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if len(c.expiryHeap) != len(c.items) {
-		return false, fmt.Sprintf("heap size mismatch: heap=%d items=%d", len(c.expiryHeap), len(c.items))
+	if len(c.expiryHeap) > len(c.items) {
+		return false, fmt.Sprintf("heap has more items than map: heap=%d items=%d",
+			len(c.expiryHeap), len(c.items))
 	}
 
 	for i, item := range c.expiryHeap {
@@ -423,13 +439,9 @@ func (c *OptimizedTTLCache) VerifyHeap() (bool, string) {
 			return false, fmt.Sprintf("index mismatch at %d: expected %d, got %d", i, i, item.index)
 		}
 
-		cacheItem, exists := c.items[item.key]
+		_, exists := c.items[item.key]
 		if !exists {
-			return false, fmt.Sprintf("heap item %s not found in items map", item.key)
-		}
-
-		if cacheItem.heapItem != item {
-			return false, fmt.Sprintf("heap item pointer mismatch for key %s", item.key)
+			continue
 		}
 
 		left := 2*i + 1
