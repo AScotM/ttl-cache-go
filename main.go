@@ -2,275 +2,265 @@ package main
 
 import (
 	"container/heap"
+	"container/list"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
 
-type HeapItem struct {
-	key        string
+type expiryItem[K comparable] struct {
+	key        K
 	expiration time.Time
 	index      int
 }
 
-type MinHeap []*HeapItem
+type expiryHeap[K comparable] []*expiryItem[K]
 
-func (h MinHeap) Len() int {
+func (h expiryHeap[K]) Len() int {
 	return len(h)
 }
 
-func (h MinHeap) Less(i, j int) bool {
+func (h expiryHeap[K]) Less(i, j int) bool {
 	return h[i].expiration.Before(h[j].expiration)
 }
 
-func (h MinHeap) Swap(i, j int) {
+func (h expiryHeap[K]) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].index = i
 	h[j].index = j
 }
 
-func (h *MinHeap) Push(x interface{}) {
-	item := x.(*HeapItem)
+func (h *expiryHeap[K]) Push(x any) {
+	item := x.(*expiryItem[K])
 	item.index = len(*h)
 	*h = append(*h, item)
 }
 
-func (h *MinHeap) Pop() interface{} {
+func (h *expiryHeap[K]) Pop() any {
 	old := *h
 	n := len(old)
+
+	if n == 0 {
+		return nil
+	}
+
 	item := old[n-1]
 	old[n-1] = nil
 	item.index = -1
 	*h = old[:n-1]
+
 	return item
 }
 
-type OptimizedTTLCache struct {
-	capacity    int
-	defaultTTL  time.Duration
-	items       map[string]*cacheItem
-	expiryHeap  MinHeap
-	mu          sync.RWMutex
-	stats       CacheStats
-	stopChan    chan struct{}
-	stopOnce    sync.Once
-	cleanupDone chan struct{}
-}
-
-type cacheItem struct {
-	value      interface{}
-	heapItem   *HeapItem
-	created    time.Time
-	accessTime time.Time
+type cacheItem[K comparable, V any] struct {
+	value      V
+	expiry     *expiryItem[K]
+	lruElement *list.Element
 }
 
 type CacheStats struct {
-	Hits        int64
-	Misses      int64
-	Evictions   int64
-	Expirations int64
+	Hits        uint64
+	Misses      uint64
+	Evictions   uint64
+	Expirations uint64
+	Deletes     uint64
+	Sets        uint64
+	Updates     uint64
 	HitRate     float64
 }
 
-func NewOptimizedTTLCache(capacity int, ttl time.Duration) *OptimizedTTLCache {
+type CacheSnapshot struct {
+	Size         int
+	Capacity     int
+	DefaultTTL   time.Duration
+	NextExpiryIn time.Duration
+	Stats        CacheStats
+}
+
+type Cache[K comparable, V any] struct {
+	mu         sync.RWMutex
+	capacity   int
+	defaultTTL time.Duration
+	items      map[K]*cacheItem[K, V]
+	expiries   expiryHeap[K]
+	lru        *list.List
+	stats      CacheStats
+
+	wake     chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func NewCache[K comparable, V any](capacity int, defaultTTL time.Duration) *Cache[K, V] {
 	if capacity <= 0 {
 		capacity = 1000
 	}
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
+
+	if defaultTTL <= 0 {
+		defaultTTL = 5 * time.Minute
 	}
 
-	cache := &OptimizedTTLCache{
-		capacity:    capacity,
-		defaultTTL:  ttl,
-		items:       make(map[string]*cacheItem),
-		expiryHeap:  MinHeap{},
-		stopChan:    make(chan struct{}),
-		cleanupDone: make(chan struct{}),
+	c := &Cache[K, V]{
+		capacity:   capacity,
+		defaultTTL: defaultTTL,
+		items:      make(map[K]*cacheItem[K, V], capacity),
+		expiries:   make(expiryHeap[K], 0, capacity),
+		lru:        list.New(),
+		wake:       make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 
-	heap.Init(&cache.expiryHeap)
-	go cache.cleanupWorker()
+	heap.Init(&c.expiries)
+	go c.cleanupWorker()
 
-	return cache
+	return c
 }
 
-func isExpired(now time.Time, expiration time.Time) bool {
+func expired(now, expiration time.Time) bool {
 	return !now.Before(expiration)
 }
 
-func (c *OptimizedTTLCache) Set(key string, value interface{}) {
+func (c *Cache[K, V]) Set(key K, value V) {
 	c.SetWithTTL(key, value, c.defaultTTL)
 }
 
-func (c *OptimizedTTLCache) SetWithTTL(key string, value interface{}, ttl time.Duration) {
-	if key == "" {
-		return
-	}
+func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = c.defaultTTL
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	now := time.Now()
 	expiration := now.Add(ttl)
 
-	if existing, exists := c.items[key]; exists {
-		existing.value = value
-		existing.accessTime = now
-		existing.heapItem.expiration = expiration
-		heap.Fix(&c.expiryHeap, existing.heapItem.index)
-		return
-	}
+	c.mu.Lock()
 
 	c.cleanupExpiredLocked(now)
 
-	for len(c.items) >= c.capacity {
-		c.evictOneLocked(now)
+	if item, exists := c.items[key]; exists {
+		oldEarliest := c.earliestExpirationLocked()
+
+		item.value = value
+		item.expiry.expiration = expiration
+		heap.Fix(&c.expiries, item.expiry.index)
+		c.lru.MoveToFront(item.lruElement)
+
+		c.stats.Sets++
+		c.stats.Updates++
+
+		newEarliest := c.earliestExpirationLocked()
+		c.mu.Unlock()
+
+		if deadlineChanged(oldEarliest, newEarliest) {
+			c.signalWake()
+		}
+
+		return
 	}
 
-	heapItem := &HeapItem{
+	for len(c.items) >= c.capacity {
+		c.evictLRULocked()
+	}
+
+	oldEarliest := c.earliestExpirationLocked()
+
+	expiry := &expiryItem[K]{
 		key:        key,
 		expiration: expiration,
+		index:      -1,
 	}
 
-	item := &cacheItem{
+	lruElement := c.lru.PushFront(key)
+
+	c.items[key] = &cacheItem[K, V]{
 		value:      value,
-		heapItem:   heapItem,
-		created:    now,
-		accessTime: now,
+		expiry:     expiry,
+		lruElement: lruElement,
 	}
 
-	c.items[key] = item
-	heap.Push(&c.expiryHeap, heapItem)
+	heap.Push(&c.expiries, expiry)
+	c.stats.Sets++
+
+	newEarliest := c.earliestExpirationLocked()
+	c.mu.Unlock()
+
+	if deadlineChanged(oldEarliest, newEarliest) {
+		c.signalWake()
+	}
 }
 
-func (c *OptimizedTTLCache) evictOneLocked(now time.Time) {
-	if c.expiryHeap.Len() == 0 {
-		return
-	}
+func (c *Cache[K, V]) Get(key K) (V, bool) {
+	var zero V
 
-	if isExpired(now, c.expiryHeap[0].expiration) {
-		heapItem := heap.Pop(&c.expiryHeap).(*HeapItem)
-		if _, exists := c.items[heapItem.key]; exists {
-			delete(c.items, heapItem.key)
-			c.stats.Expirations++
-		}
-		return
-	}
-
-	var oldestKey string
-	var oldestTime time.Time
-
-	for key, item := range c.items {
-		if oldestKey == "" || item.accessTime.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = item.accessTime
-		}
-	}
-
-	if oldestKey == "" {
-		return
-	}
-
-	item := c.items[oldestKey]
-	if item.heapItem.index >= 0 {
-		heap.Remove(&c.expiryHeap, item.heapItem.index)
-	}
-	delete(c.items, oldestKey)
-	c.stats.Evictions++
-}
-
-func (c *OptimizedTTLCache) Get(key string) (interface{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	item, exists := c.items[key]
 	if !exists {
 		c.stats.Misses++
-		return nil, false
+		return zero, false
 	}
 
 	now := time.Now()
-
-	if isExpired(now, item.heapItem.expiration) {
-		if item.heapItem.index >= 0 {
-			heap.Remove(&c.expiryHeap, item.heapItem.index)
-		}
-		delete(c.items, key)
-		c.stats.Expirations++
+	if expired(now, item.expiry.expiration) {
+		c.removeItemLocked(key, item, true, false)
 		c.stats.Misses++
-		return nil, false
+		return zero, false
 	}
 
-	item.accessTime = now
+	c.lru.MoveToFront(item.lruElement)
 	c.stats.Hits++
 
 	return item.value, true
 }
 
-func (c *OptimizedTTLCache) cleanupWorker() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	defer close(c.cleanupDone)
+func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
+	var zero V
 
-	for {
-		select {
-		case <-ticker.C:
-			c.CleanupExpired()
-		case <-c.stopChan:
-			return
-		}
-	}
-}
-
-func (c *OptimizedTTLCache) CleanupExpired() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.cleanupExpiredLocked(time.Now())
-}
-
-func (c *OptimizedTTLCache) cleanupExpiredLocked(now time.Time) int {
-	count := 0
-
-	for c.expiryHeap.Len() > 0 {
-		heapItem := c.expiryHeap[0]
-		if !isExpired(now, heapItem.expiration) {
-			break
-		}
-
-		heap.Pop(&c.expiryHeap)
-
-		if _, exists := c.items[heapItem.key]; exists {
-			delete(c.items, heapItem.key)
-			count++
-		}
+	item, exists := c.items[key]
+	if !exists {
+		c.stats.Misses++
+		return zero, time.Time{}, false
 	}
 
-	c.stats.Expirations += int64(count)
-	return count
+	now := time.Now()
+	if expired(now, item.expiry.expiration) {
+		c.removeItemLocked(key, item, true, false)
+		c.stats.Misses++
+		return zero, time.Time{}, false
+	}
+
+	c.lru.MoveToFront(item.lruElement)
+	c.stats.Hits++
+
+	return item.value, item.expiry.expiration, true
 }
 
-func (c *OptimizedTTLCache) Size() int {
+func (c *Cache[K, V]) Peek(key K) (V, bool) {
+	var zero V
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.cleanupExpiredLocked(time.Now())
+	item, exists := c.items[key]
+	if !exists {
+		return zero, false
+	}
 
-	return len(c.items)
+	if expired(time.Now(), item.expiry.expiration) {
+		c.removeItemLocked(key, item, true, false)
+		return zero, false
+	}
+
+	return item.value, true
 }
 
-func (c *OptimizedTTLCache) Stop() {
-	c.stopOnce.Do(func() {
-		close(c.stopChan)
-		<-c.cleanupDone
-	})
-}
-
-func (c *OptimizedTTLCache) Delete(key string) bool {
+func (c *Cache[K, V]) Contains(key K) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -279,31 +269,168 @@ func (c *OptimizedTTLCache) Delete(key string) bool {
 		return false
 	}
 
-	if item.heapItem.index >= 0 {
-		heap.Remove(&c.expiryHeap, item.heapItem.index)
+	if expired(time.Now(), item.expiry.expiration) {
+		c.removeItemLocked(key, item, true, false)
+		return false
 	}
-	delete(c.items, key)
 
 	return true
 }
 
-func (c *OptimizedTTLCache) Clear() {
+func (c *Cache[K, V]) Delete(key K) bool {
+	c.mu.Lock()
+
+	item, exists := c.items[key]
+	if !exists {
+		c.mu.Unlock()
+		return false
+	}
+
+	wasEarliest := item.expiry.index == 0
+	c.removeItemLocked(key, item, false, true)
+	c.mu.Unlock()
+
+	if wasEarliest {
+		c.signalWake()
+	}
+
+	return true
+}
+
+func (c *Cache[K, V]) Clear() {
+	c.mu.Lock()
+
+	for _, item := range c.items {
+		item.expiry.index = -1
+	}
+
+	c.items = make(map[K]*cacheItem[K, V], c.capacity)
+	c.expiries = make(expiryHeap[K], 0, c.capacity)
+	heap.Init(&c.expiries)
+	c.lru.Init()
+	c.stats = CacheStats{}
+
+	c.mu.Unlock()
+	c.signalWake()
+}
+
+func (c *Cache[K, V]) Size() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, item := range c.items {
-		if item.heapItem != nil {
-			item.heapItem.index = -1
-		}
-	}
-
-	c.items = make(map[string]*cacheItem)
-	c.expiryHeap = MinHeap{}
-	heap.Init(&c.expiryHeap)
-	c.stats = CacheStats{}
+	c.cleanupExpiredLocked(time.Now())
+	return len(c.items)
 }
 
-func (c *OptimizedTTLCache) GetStats() CacheStats {
+func (c *Cache[K, V]) Capacity() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.capacity
+}
+
+func (c *Cache[K, V]) DefaultTTL() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.defaultTTL
+}
+
+func (c *Cache[K, V]) SetDefaultTTL(ttl time.Duration) bool {
+	if ttl <= 0 {
+		return false
+	}
+
+	c.mu.Lock()
+	c.defaultTTL = ttl
+	c.mu.Unlock()
+
+	return true
+}
+
+func (c *Cache[K, V]) Resize(newCapacity int) bool {
+	if newCapacity <= 0 {
+		return false
+	}
+
+	c.mu.Lock()
+
+	c.cleanupExpiredLocked(time.Now())
+	c.capacity = newCapacity
+
+	for len(c.items) > c.capacity {
+		c.evictLRULocked()
+	}
+
+	c.mu.Unlock()
+
+	return true
+}
+
+func (c *Cache[K, V]) Keys() []K {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.cleanupExpiredLocked(time.Now())
+
+	keys := make([]K, 0, len(c.items))
+	for key := range c.items {
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func (c *Cache[K, V]) KeysByRecency() []K {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.cleanupExpiredLocked(time.Now())
+
+	keys := make([]K, 0, len(c.items))
+	for element := c.lru.Front(); element != nil; element = element.Next() {
+		keys = append(keys, element.Value.(K))
+	}
+
+	return keys
+}
+
+func (c *Cache[K, V]) GetMultiple(keys []K) map[K]V {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := make(map[K]V, len(keys))
+	now := time.Now()
+
+	for _, key := range keys {
+		item, exists := c.items[key]
+		if !exists {
+			c.stats.Misses++
+			continue
+		}
+
+		if expired(now, item.expiry.expiration) {
+			c.removeItemLocked(key, item, true, false)
+			c.stats.Misses++
+			continue
+		}
+
+		c.lru.MoveToFront(item.lruElement)
+		c.stats.Hits++
+		result[key] = item.value
+	}
+
+	return result
+}
+
+func (c *Cache[K, V]) CleanupExpired() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.cleanupExpiredLocked(time.Now())
+}
+
+func (c *Cache[K, V]) Stats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -317,244 +444,423 @@ func (c *OptimizedTTLCache) GetStats() CacheStats {
 	return stats
 }
 
-func (c *OptimizedTTLCache) Keys() []string {
+func (c *Cache[K, V]) Snapshot() CacheSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	c.cleanupExpiredLocked(time.Now())
-
-	keys := make([]string, 0, len(c.items))
-	for key := range c.items {
-		keys = append(keys, key)
-	}
-
-	return keys
-}
-
-func (c *OptimizedTTLCache) Contains(key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	item, exists := c.items[key]
-	if !exists {
-		return false
-	}
-
-	now := time.Now()
-
-	if isExpired(now, item.heapItem.expiration) {
-		if item.heapItem.index >= 0 {
-			heap.Remove(&c.expiryHeap, item.heapItem.index)
-		}
-		delete(c.items, key)
-		c.stats.Expirations++
-		return false
-	}
-
-	return true
-}
-
-func (c *OptimizedTTLCache) GetWithExpiry(key string) (interface{}, time.Time, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	item, exists := c.items[key]
-	if !exists {
-		c.stats.Misses++
-		return nil, time.Time{}, false
-	}
-
-	now := time.Now()
-
-	if isExpired(now, item.heapItem.expiration) {
-		if item.heapItem.index >= 0 {
-			heap.Remove(&c.expiryHeap, item.heapItem.index)
-		}
-		delete(c.items, key)
-		c.stats.Expirations++
-		c.stats.Misses++
-		return nil, time.Time{}, false
-	}
-
-	item.accessTime = now
-	c.stats.Hits++
-
-	return item.value, item.heapItem.expiration, true
-}
-
-func (c *OptimizedTTLCache) Peek(key string) (interface{}, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	item, exists := c.items[key]
-	if !exists {
-		c.stats.Misses++
-		return nil, false
-	}
-
-	now := time.Now()
-	if isExpired(now, item.heapItem.expiration) {
-		if item.heapItem.index >= 0 {
-			heap.Remove(&c.expiryHeap, item.heapItem.index)
-		}
-		delete(c.items, key)
-		c.stats.Expirations++
-		c.stats.Misses++
-		return nil, false
-	}
-
-	c.stats.Hits++
-	return item.value, true
-}
-
-func (c *OptimizedTTLCache) Resize(newCapacity int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if newCapacity <= 0 {
-		newCapacity = 1000
-	}
 
 	now := time.Now()
 	c.cleanupExpiredLocked(now)
 
-	for len(c.items) > newCapacity {
-		c.evictOneLocked(now)
+	stats := c.stats
+	total := stats.Hits + stats.Misses
+	if total > 0 {
+		stats.HitRate = float64(stats.Hits) / float64(total)
 	}
 
-	c.capacity = newCapacity
+	var nextExpiry time.Duration
+	if len(c.expiries) > 0 {
+		nextExpiry = time.Until(c.expiries[0].expiration)
+		if nextExpiry < 0 {
+			nextExpiry = 0
+		}
+	}
+
+	return CacheSnapshot{
+		Size:         len(c.items),
+		Capacity:     c.capacity,
+		DefaultTTL:   c.defaultTTL,
+		NextExpiryIn: nextExpiry,
+		Stats:        stats,
+	}
 }
 
-func (c *OptimizedTTLCache) VerifyHeap() (bool, string) {
+func (c *Cache[K, V]) Verify() (bool, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if len(c.expiryHeap) > len(c.items) {
-		return false, fmt.Sprintf("heap has more items than map: heap=%d items=%d",
-			len(c.expiryHeap), len(c.items))
+	if len(c.items) != len(c.expiries) {
+		return false, fmt.Sprintf(
+			"map/heap size mismatch: map=%d heap=%d",
+			len(c.items),
+			len(c.expiries),
+		)
 	}
 
-	for i, item := range c.expiryHeap {
-		if item.index != i {
-			return false, fmt.Sprintf("index mismatch at %d: expected %d, got %d", i, i, item.index)
+	if len(c.items) != c.lru.Len() {
+		return false, fmt.Sprintf(
+			"map/LRU size mismatch: map=%d lru=%d",
+			len(c.items),
+			c.lru.Len(),
+		)
+	}
+
+	heapKeys := make(map[K]struct{}, len(c.expiries))
+
+	for i, expiry := range c.expiries {
+		if expiry == nil {
+			return false, fmt.Sprintf("nil heap item at index %d", i)
 		}
 
-		_, exists := c.items[item.key]
+		if expiry.index != i {
+			return false, fmt.Sprintf(
+				"heap index mismatch at %d: stored=%d",
+				i,
+				expiry.index,
+			)
+		}
+
+		if _, duplicate := heapKeys[expiry.key]; duplicate {
+			return false, fmt.Sprintf("duplicate heap key at index %d", i)
+		}
+
+		heapKeys[expiry.key] = struct{}{}
+
+		item, exists := c.items[expiry.key]
 		if !exists {
-			continue
+			return false, fmt.Sprintf("heap key missing from map at index %d", i)
+		}
+
+		if item.expiry != expiry {
+			return false, fmt.Sprintf("heap pointer mismatch at index %d", i)
 		}
 
 		left := 2*i + 1
 		right := 2*i + 2
 
-		if left < len(c.expiryHeap) && c.expiryHeap[left].expiration.Before(item.expiration) {
-			return false, fmt.Sprintf("heap order violation at %d and left child %d", i, left)
+		if left < len(c.expiries) &&
+			c.expiries[left].expiration.Before(expiry.expiration) {
+			return false, fmt.Sprintf(
+				"heap order violation between %d and %d",
+				i,
+				left,
+			)
 		}
 
-		if right < len(c.expiryHeap) && c.expiryHeap[right].expiration.Before(item.expiration) {
-			return false, fmt.Sprintf("heap order violation at %d and right child %d", i, right)
+		if right < len(c.expiries) &&
+			c.expiries[right].expiration.Before(expiry.expiration) {
+			return false, fmt.Sprintf(
+				"heap order violation between %d and %d",
+				i,
+				right,
+			)
 		}
 	}
 
-	return true, "heap is valid"
+	lruKeys := make(map[K]struct{}, c.lru.Len())
+
+	for element := c.lru.Front(); element != nil; element = element.Next() {
+		key, ok := element.Value.(K)
+		if !ok {
+			return false, "invalid key type in LRU list"
+		}
+
+		if _, duplicate := lruKeys[key]; duplicate {
+			return false, "duplicate key in LRU list"
+		}
+
+		lruKeys[key] = struct{}{}
+
+		item, exists := c.items[key]
+		if !exists {
+			return false, "LRU key missing from map"
+		}
+
+		if item.lruElement != element {
+			return false, "LRU element pointer mismatch"
+		}
+	}
+
+	for key, item := range c.items {
+		if item == nil {
+			return false, "nil cache item"
+		}
+
+		if item.expiry == nil {
+			return false, "cache item has nil expiry"
+		}
+
+		if item.lruElement == nil {
+			return false, "cache item has nil LRU element"
+		}
+
+		if _, exists := heapKeys[key]; !exists {
+			return false, "map key missing from expiry heap"
+		}
+
+		if _, exists := lruKeys[key]; !exists {
+			return false, "map key missing from LRU list"
+		}
+	}
+
+	return true, "cache structures are valid"
 }
 
-func (c *OptimizedTTLCache) Capacity() int {
+func (c *Cache[K, V]) Stop() {
+	c.stopOnce.Do(func() {
+		close(c.stop)
+		<-c.done
+	})
+}
+
+func (c *Cache[K, V]) cleanupWorker() {
+	defer close(c.done)
+
+	var timer *time.Timer
+	var timerChannel <-chan time.Time
+
+	for {
+		delay, hasExpiry := c.nextCleanupDelay()
+
+		if hasExpiry {
+			if timer == nil {
+				timer = time.NewTimer(delay)
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+
+				timer.Reset(delay)
+			}
+
+			timerChannel = timer.C
+		} else {
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+
+			timerChannel = nil
+		}
+
+		select {
+		case <-timerChannel:
+			c.CleanupExpired()
+
+		case <-c.wake:
+
+		case <-c.stop:
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+			return
+		}
+	}
+}
+
+func (c *Cache[K, V]) nextCleanupDelay() (time.Duration, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.capacity
-}
-
-func (c *OptimizedTTLCache) GetMultiple(keys []string) map[string]interface{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	result := make(map[string]interface{}, len(keys))
-	now := time.Now()
-
-	for _, key := range keys {
-		item, exists := c.items[key]
-		if !exists {
-			c.stats.Misses++
-			continue
-		}
-
-		if isExpired(now, item.heapItem.expiration) {
-			if item.heapItem.index >= 0 {
-				heap.Remove(&c.expiryHeap, item.heapItem.index)
-			}
-			delete(c.items, key)
-			c.stats.Expirations++
-			c.stats.Misses++
-			continue
-		}
-
-		item.accessTime = now
-		result[key] = item.value
-		c.stats.Hits++
+	if len(c.expiries) == 0 {
+		return 0, false
 	}
 
-	return result
+	delay := time.Until(c.expiries[0].expiration)
+	if delay < 0 {
+		delay = 0
+	}
+
+	return delay, true
+}
+
+func (c *Cache[K, V]) cleanupExpiredLocked(now time.Time) int {
+	count := 0
+
+	for len(c.expiries) > 0 {
+		expiry := c.expiries[0]
+
+		if !expired(now, expiry.expiration) {
+			break
+		}
+
+		item, exists := c.items[expiry.key]
+
+		if !exists {
+			heap.Pop(&c.expiries)
+			continue
+		}
+
+		c.removeItemLocked(expiry.key, item, true, false)
+		count++
+	}
+
+	return count
+}
+
+func (c *Cache[K, V]) removeItemLocked(
+	key K,
+	item *cacheItem[K, V],
+	expiration bool,
+	deletion bool,
+) {
+	if item.expiry != nil && item.expiry.index >= 0 {
+		heap.Remove(&c.expiries, item.expiry.index)
+	}
+
+	if item.lruElement != nil {
+		c.lru.Remove(item.lruElement)
+	}
+
+	delete(c.items, key)
+
+	if expiration {
+		c.stats.Expirations++
+	}
+
+	if deletion {
+		c.stats.Deletes++
+	}
+}
+
+func (c *Cache[K, V]) evictLRULocked() bool {
+	element := c.lru.Back()
+	if element == nil {
+		return false
+	}
+
+	key := element.Value.(K)
+	item, exists := c.items[key]
+
+	if !exists {
+		c.lru.Remove(element)
+		return false
+	}
+
+	c.removeItemLocked(key, item, false, false)
+	c.stats.Evictions++
+
+	return true
+}
+
+func (c *Cache[K, V]) earliestExpirationLocked() time.Time {
+	if len(c.expiries) == 0 {
+		return time.Time{}
+	}
+
+	return c.expiries[0].expiration
+}
+
+func deadlineChanged(a, b time.Time) bool {
+	if a.IsZero() != b.IsZero() {
+		return true
+	}
+
+	if a.IsZero() {
+		return false
+	}
+
+	return !a.Equal(b)
+}
+
+func (c *Cache[K, V]) signalWake() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 func main() {
-	fmt.Println("=== Optimized TTL Cache with Heap ===")
-	fmt.Println()
-
-	cache := NewOptimizedTTLCache(5, 2*time.Second)
+	cache := NewCache[string, int](5, 5*time.Second)
 	defer cache.Stop()
 
-	fmt.Printf("Initial capacity: %d\n", cache.Capacity())
+	fmt.Println("TTL + LRU Cache")
+	fmt.Println()
 
-	cache.SetWithTTL("fast", "expires in 1s", time.Second)
-	cache.SetWithTTL("medium", "expires in 3s", 3*time.Second)
-	cache.SetWithTTL("slow", "expires in 5s", 5*time.Second)
+	cache.SetWithTTL("alpha", 10, 2*time.Second)
+	cache.SetWithTTL("beta", 20, 4*time.Second)
+	cache.SetWithTTL("gamma", 30, 6*time.Second)
+	cache.Set("delta", 40)
+	cache.Set("epsilon", 50)
 
-	fmt.Printf("Initial size: %d\n", cache.Size())
+	fmt.Printf("Size: %d\n", cache.Size())
+	fmt.Printf("Capacity: %d\n", cache.Capacity())
+	fmt.Printf("LRU order: %v\n", cache.KeysByRecency())
 
-	time.Sleep(2 * time.Second)
-
-	items := []string{"fast", "medium", "slow"}
-	for _, key := range items {
-		if val, found := cache.Get(key); found {
-			fmt.Printf("%s: %v\n", key, val)
-		} else {
-			fmt.Printf("%s: expired\n", key)
-		}
+	if value, ok := cache.Get("alpha"); ok {
+		fmt.Printf("alpha: %d\n", value)
 	}
 
-	fmt.Println("\nAdding 10 items with capacity 5...")
-	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("item%d", i)
-		cache.SetWithTTL(key, i, time.Duration(i+1)*time.Second)
+	if value, ok := cache.Get("gamma"); ok {
+		fmt.Printf("gamma: %d\n", value)
 	}
 
-	fmt.Printf("Size after adding: %d\n", cache.Size())
+	fmt.Printf("LRU after reads: %v\n", cache.KeysByRecency())
 
-	cache.Resize(8)
-	fmt.Printf("Capacity after resize: %d\n", cache.Capacity())
+	cache.Set("zeta", 60)
 
-	heapValid, message := cache.VerifyHeap()
-	fmt.Printf("Heap integrity check: %v - %s\n", heapValid, message)
+	fmt.Printf("LRU after capacity eviction: %v\n", cache.KeysByRecency())
 
-	time.Sleep(6 * time.Second)
+	if _, ok := cache.Peek("beta"); ok {
+		fmt.Println("beta is still present")
+	} else {
+		fmt.Println("beta is not present")
+	}
 
-	fmt.Printf("Size after cleanup: %d\n", cache.Size())
+	time.Sleep(3 * time.Second)
 
-	stats := cache.GetStats()
-	fmt.Printf("Stats - Hits: %d, Misses: %d, Evictions: %d, Expirations: %d, HitRate: %.2f\n",
-		stats.Hits, stats.Misses, stats.Evictions, stats.Expirations, stats.HitRate)
+	if _, ok := cache.Get("alpha"); !ok {
+		fmt.Println("alpha expired")
+	}
 
-	keys := cache.Keys()
-	fmt.Printf("Active keys: %v\n", keys)
+	cache.SetWithTTL("short", 100, time.Second)
+	cache.SetWithTTL("long", 200, 10*time.Second)
 
-	multipleKeys := []string{"item5", "item6", "item7", "nonexistent"}
-	multipleResults := cache.GetMultiple(multipleKeys)
-	fmt.Printf("Multiple get results: %v\n", multipleResults)
+	results := cache.GetMultiple([]string{
+		"gamma",
+		"delta",
+		"short",
+		"missing",
+	})
 
-	heapValid, message = cache.VerifyHeap()
-	fmt.Printf("Final heap integrity check: %v - %s\n", heapValid, message)
+	resultKeys := make([]string, 0, len(results))
+	for key := range results {
+		resultKeys = append(resultKeys, key)
+	}
+	sort.Strings(resultKeys)
 
-	fmt.Println("\n=== Demo Complete ===")
+	fmt.Println("Multiple get:")
+	for _, key := range resultKeys {
+		fmt.Printf("%s=%d\n", key, results[key])
+	}
+
+	valid, message := cache.Verify()
+	fmt.Printf("Integrity: %v - %s\n", valid, message)
+
+	snapshot := cache.Snapshot()
+
+	fmt.Printf("Size: %d/%d\n", snapshot.Size, snapshot.Capacity)
+	fmt.Printf("Default TTL: %s\n", snapshot.DefaultTTL)
+	fmt.Printf("Next expiry: %s\n", snapshot.NextExpiryIn.Round(time.Millisecond))
+	fmt.Printf(
+		"Stats: hits=%d misses=%d evictions=%d expirations=%d deletes=%d sets=%d updates=%d hit-rate=%.2f%%\n",
+		snapshot.Stats.Hits,
+		snapshot.Stats.Misses,
+		snapshot.Stats.Evictions,
+		snapshot.Stats.Expirations,
+		snapshot.Stats.Deletes,
+		snapshot.Stats.Sets,
+		snapshot.Stats.Updates,
+		snapshot.Stats.HitRate*100,
+	)
+
+	fmt.Printf("Keys: %v\n", cache.KeysByRecency())
+
+	cache.Resize(3)
+
+	fmt.Printf("After resize: %v\n", cache.KeysByRecency())
+
+	valid, message = cache.Verify()
+	fmt.Printf("Final integrity: %v - %s\n", valid, message)
 }
